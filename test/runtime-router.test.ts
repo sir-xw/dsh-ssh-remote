@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { SubprocessExecutableNotFoundError } from '@deepseek-ai/dsh-subprocess';
 import {
   buildRemoteSshInvocation,
   installRemoteFileSystemRouter,
   installRemoteSubprocessRouter,
+  installRemoteTerminalControllerRouter,
+  type TerminalControllerService,
 } from '../src/runtime-router.js';
 import { SshRemoteService } from '../src/registry.js';
 
@@ -52,7 +55,11 @@ function fakeConnections() {
 }
 
 describe('remote Workspace routing', () => {
-  it('maps only an exact anchor boundary and its descendants', () => {
+  // The anchor map is keyed by realpath on a case-insensitive filesystem where
+  // `node:path` also rewrites `/a/b` to `C:\a\b`, so this fixture asserts an
+  // exact POSIX anchor identity and carries no meaning on Windows. Descendant
+  // routing is covered on every platform by the resolver-driven tests below.
+  it.skipIf(process.platform === 'win32')('maps only an exact anchor boundary and its descendants', () => {
     const service = Object.create(SshRemoteService.prototype) as SshRemoteService & {
       anchors: Map<string, unknown>;
     };
@@ -161,10 +168,16 @@ describe('remote Workspace routing', () => {
     const localHandle = { pid: 1 };
     const spawn = vi.fn(() => localHandle);
     const spawnTerminal = vi.fn(async () => ({ pid: 2 }));
-    const runtime = { spawn, spawnTerminal };
-    const restore = installRemoteSubprocessRouter(
+    const runtime = {
+      spawn,
+      spawnTerminal,
+      resolveExecutable: vi.fn(async (command: string) => `/local/${command}`),
+      terminalEnvironment: vi.fn(async () => ({ platform: 'posix' as const })),
+    };
+    const { restore } = installRemoteSubprocessRouter(
       runtime as never,
       (path) => path === '/anchors/project' ? 'ssh://gpu/home/atlas/project' : undefined,
+      fakeHelpers(),
     );
 
     runtime.spawn({
@@ -187,7 +200,126 @@ describe('remote Workspace routing', () => {
     expect(spawn.mock.calls.at(-1)?.[0]).toBe(localSearch);
     restore();
   });
+
+  it('resolves a path-shaped executable on the SSH host and a bare name locally', async () => {
+    const runtime = {
+      spawn: vi.fn(),
+      spawnTerminal: vi.fn(),
+      resolveExecutable: vi.fn(async (command: string) => `/local/${command}`),
+      terminalEnvironment: vi.fn(),
+    };
+    const call = vi.fn(async (_method: string, params: { command: string }) => ({ path: `/remote/${params.command}` }));
+    const { restore } = installRemoteSubprocessRouter(
+      runtime as never,
+      anchorResolver(),
+      fakeHelpers(call),
+    );
+
+    // An anchored path has a remote identity, so it resolves on that host.
+    await expect(runtime.resolveExecutable('/anchors/project/bin/tool')).resolves.toBe('/remote//anchors/project/bin/tool');
+    expect(call).toHaveBeenCalledWith('executable/resolve', { command: '/anchors/project/bin/tool' }, expect.anything());
+
+    // A bare name carries no workspace identity: the local provider answers.
+    call.mockClear();
+    await expect(runtime.resolveExecutable('rg')).resolves.toBe('/local/rg');
+    expect(call).not.toHaveBeenCalled();
+    restore();
+  });
+
+  it('maps an executable miss to SubprocessExecutableNotFoundError', async () => {
+    const runtime = {
+      spawn: vi.fn(),
+      spawnTerminal: vi.fn(),
+      resolveExecutable: vi.fn(),
+      terminalEnvironment: vi.fn(),
+    };
+    const miss = Object.assign(new Error('command "zsh" was not found on PATH'), { code: 'E_NOT_FOUND' });
+    const { restore } = installRemoteSubprocessRouter(
+      runtime as never,
+      anchorResolver(),
+      fakeHelpers(vi.fn(async () => { throw miss; })),
+    );
+
+    await expect(runtime.resolveExecutable('/anchors/project/zsh'))
+      .rejects.toBeInstanceOf(SubprocessExecutableNotFoundError);
+    restore();
+  });
+
+  it('reports the SSH host shell as the terminal environment for a remote cwd', async () => {
+    const runtime = {
+      spawn: vi.fn(),
+      spawnTerminal: vi.fn(),
+      resolveExecutable: vi.fn(),
+      terminalEnvironment: vi.fn(async () => ({ platform: 'windows' as const, defaultShell: 'C:\\Windows\\cmd.exe' })),
+    };
+    const { restore } = installRemoteSubprocessRouter(
+      runtime as never,
+      anchorResolver(),
+      fakeHelpers(vi.fn(), 'Linux', '/bin/bash'),
+      (path) => path === 'C:\\Windows\\cmd.exe' ? 'ssh://gpu/home/atlas/project' : undefined,
+    );
+
+    await expect(runtime.terminalEnvironment()).resolves.toEqual({ platform: 'posix', defaultShell: '/bin/bash' });
+    restore();
+  });
+
+  it('binds terminal shell discovery to the agent workspace instead of the client', async () => {
+    const discover = vi.fn(async (_method: string, params: { command: string }) => {
+      // The host reports `/bin/bash` as its login shell; `/bin` is a symlink to
+      // `/usr/bin`, so the canonical result differs from the request.
+      if (params.command === 'bash' || params.command === '/bin/bash') return { path: '/usr/bin/bash' };
+      throw Object.assign(new Error(`command "${params.command}" was not found on PATH`), { code: 'E_NOT_FOUND' });
+    });
+    const controller: TerminalControllerService = {
+      shells: vi.fn(async () => [{ path: 'C:\\Windows\\cmd.exe' }]),
+      spawn: vi.fn(async () => 'local-terminal'),
+    };
+    const runtime = {
+      spawn: vi.fn(),
+      spawnTerminal: vi.fn(),
+      resolveExecutable: vi.fn(),
+      terminalEnvironment: vi.fn(),
+    };
+    const restore = installRemoteTerminalControllerRouter(
+      controller,
+      anchorResolver(),
+      fakeHelpers(discover),
+      { spawn: runtime.spawn, spawnTerminal: runtime.spawnTerminal },
+      runtime as never,
+    );
+
+    const remote = { session: { header: { cwd: '/anchors/project' } } };
+    await expect(controller.shells?.(remote)).resolves.toEqual([
+      { args: ['-i'], name: 'bash', path: '/usr/bin/bash' },
+    ]);
+    expect(discover).toHaveBeenCalledWith('executable/resolve', { command: 'bash' }, expect.anything());
+    // A local workspace keeps the stock discovery untouched.
+    discover.mockClear();
+    await controller.shells?.({ session: { header: { cwd: '/tmp/local' } } });
+    expect(discover).not.toHaveBeenCalled();
+    restore();
+  });
 });
+
+/** Resolver covering one anchor and its descendants, mirroring `resolveRemotePath`. */
+function anchorResolver(anchor = '/anchors/project', uri = 'ssh://gpu/home/atlas/project') {
+  return (path: string): string | undefined =>
+    path === anchor || path.startsWith(`${anchor}/`) ? `${uri}${path.slice(anchor.length)}` : undefined;
+}
+
+/** Minimal helper provider: only the client handshake and one RPC shape are exercised. */
+function fakeHelpers(
+  call: (method: string, params: { command: string }, options?: unknown) => Promise<{ path: string }> =
+    vi.fn(async (_method: string, params: { command: string }) => ({ path: `/remote/${params.command}` })),
+  system = 'Linux',
+  shell = '/bin/bash',
+) {
+  return {
+    async client() {
+      return { hello: { platform: { system, shell } }, call };
+    },
+  } as never;
+}
 
 describe('OpenSSH process invocation', () => {
   const cwd = 'ssh://gpu/home/atlas/project';

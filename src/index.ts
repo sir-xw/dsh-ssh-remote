@@ -6,6 +6,7 @@ import { installRemoteShellRouter, RemoteShellProcessTracker } from './helper-sh
 import {
   installRemoteFileSystemRouter,
   installRemoteSubprocessRouter,
+  installRemoteTerminalControllerRouter,
   installRemoteTerminalRouter,
 } from './runtime-router.js';
 import { RemoteTerminalBackend } from './terminal.js';
@@ -14,6 +15,13 @@ import type {} from '@deepseek-ai/dsh-shell';
 import type {} from '@deepseek-ai/dsh-sandbox-policy';
 import type {} from '@deepseek-ai/dsh-subprocess';
 import type {} from '@deepseek-ai/dsh-terminal';
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Web-terminal controller owned by `@deepseek-ai/dsh-api-terminal-controller`. */
+    terminalController: import('./runtime-router.js').TerminalControllerService;
+  }
+}
 
 export type {
   DiscoveredSshHost,
@@ -32,7 +40,7 @@ export const name = 'dsh-ssh-remote';
 export const inject = ['fs', 'subprocess'];
 
 /** Legacy SSH host fallback consumed through the standard Cordis Config. */
-export const Config = LegacySshRemoteSettingsSchema;
+export const Config: typeof LegacySshRemoteSettingsSchema = LegacySshRemoteSettingsSchema;
 
 export function apply(ctx: Context, config: LegacySshConfig) {
   const helpers = new RemoteHelperManager({ aliasValidator: hasConcreteSshAlias });
@@ -45,7 +53,21 @@ export function apply(ctx: Context, config: LegacySshConfig) {
     resolveRemotePath,
     helpers,
   );
-  const restoreSubprocess = installRemoteSubprocessRouter(ctx.subprocess, resolveRemotePath);
+  const subprocessRouter = installRemoteSubprocessRouter(ctx.subprocess, resolveRemotePath, helpers);
+  const restoreSubprocess = subprocessRouter.restore;
+
+  // The Web terminal panel resolves shells through the session's execution
+  // world, which only the agent context carries. Bind that resolution per
+  // agent so shell discovery and terminal allocation always answer for the
+  // workspace the agent owns.
+  const terminalControllerFiber = ctx.inject(['terminalController'], (scope) =>
+    installRemoteTerminalControllerRouter(
+      scope.terminalController,
+      resolveRemotePath,
+      helpers,
+      subprocessRouter.delegate,
+      ctx.subprocess,
+    ));
 
   // Optional capability seams use child fibers: they activate whenever the
   // corresponding host services exist, unload cleanly when providers reload,
@@ -79,6 +101,7 @@ export function apply(ctx: Context, config: LegacySshConfig) {
     // before the host-level helper session is explicitly closed.
     const childResults = await Promise.allSettled([
       terminalFiber.dispose(),
+      terminalControllerFiber.dispose(),
       shellFiber.dispose(),
     ]);
     restoreSubprocess();

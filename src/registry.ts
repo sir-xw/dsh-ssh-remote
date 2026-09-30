@@ -27,13 +27,32 @@ const DIRECTORY_PAGE_LIMIT = 1000;
 const DIRECTORY_INPUT_LIMIT = 5000;
 const DIRECTORY_SCAN_BATCH = 32;
 
+/** One pre-Codex-style SSH host entry. */
+export interface SshHostEntry {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  identityFile: string;
+  proxyJump: string;
+}
+
+/** Resolved fallback settings, the shape `apply` receives. */
+export interface LegacySshConfig {
+  hosts: SshHostEntry[];
+}
+
 /**
  * Pre-Codex-style settings schema. Existing entries remain a read-only
  * fallback so an upgrade does not break already registered workspaces.
  * Declared as the plugin's Cordis `Config`; resolved values reach
  * `apply(ctx, config)` and the service constructor.
+ *
+ * The explicit `z<LegacySshConfig>` annotation keeps the emitted declaration
+ * self-contained: without it TypeScript has to name an inferred type owned by
+ * a transitive schemastery dependency, which fails as non-portable (TS2742).
  */
-export const LegacySshRemoteSettingsSchema = z.object({
+export const LegacySshRemoteSettingsSchema: z<LegacySshConfig> = z.object({
   hosts: z
     .array(
       z.object({
@@ -47,19 +66,6 @@ export const LegacySshRemoteSettingsSchema = z.object({
     )
     .default([]),
 });
-
-export interface SshHostEntry {
-  name: string;
-  host: string;
-  port: number;
-  user: string;
-  identityFile: string;
-  proxyJump: string;
-}
-
-export interface LegacySshConfig {
-  hosts: SshHostEntry[];
-}
 
 /** A concrete SSH alias discovered and resolved through local OpenSSH. */
 export interface DiscoveredSshHost {

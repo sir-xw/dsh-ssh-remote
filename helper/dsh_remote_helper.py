@@ -404,6 +404,18 @@ class Server:
                 "uptimeMs": int((time.monotonic()-self.started)*1000), "workspaces": len(self.workspaces),
                 "processes": len(self.processes), "pathLocks": len(self.path_locks),
                 "readHandles": len(self.read_handles), "writeHandles": len(self.write_handles)}
+        if method == "executable/resolve":
+            command = p.get("command")
+            if not isinstance(command, str) or command == "" or "\0" in command or len(command) > 4096:
+                raise RpcError("E_INVALID_PARAMS", "command must be a non-empty string without NUL bytes")
+            if os.path.isabs(command):
+                found = command if os.access(command, os.X_OK) else None
+                missing = "is not an executable file"
+            else:
+                found = shutil.which(command)
+                missing = "was not found on PATH"
+            if found is None: raise RpcError("E_NOT_FOUND", "command " + json.dumps(command) + " " + missing)
+            return {"path": os.path.realpath(found), "command": command}
         if method == "workspace/open":
             def open_workspace() -> Dict[str, Any]:
                 ws = Workspace(p.get("path"), p.get("access", "read-only")); wid = valid_id(p.get("workspaceId") or secrets.token_hex(16), "workspaceId")

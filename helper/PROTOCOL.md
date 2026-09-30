@@ -161,6 +161,27 @@ response; different bytes or another cursor return `E_CURSOR`. Commit performs
 the expected-version check, permission inheritance, fsync and atomic publish.
 Open, chunk, commit, and abort are protected by operationId replay journals.
 
+## Executable resolution
+
+```text
+executable/resolve {command}
+```
+
+Resolves one executable against the remote host's own environment and requires
+no workspace: a bare name is looked up on the daemon's `PATH` (`shutil.which`,
+including `PATHEXT` semantics on platforms that define it), an absolute path is
+accepted only when it is executable (`X_OK`). The result is
+`{path, command}` with the canonical absolute `path` of the resolved file.
+
+A miss fails with `E_NOT_FOUND`; the message distinguishes a name absent from
+`PATH` from an absolute path that is present but not executable. This method
+exists so that an execution-environment consumer — terminal shell discovery and
+shell verification in particular — asks the host that will run the program
+instead of resolving candidates on the client, where a client-local shell
+(`cmd.exe`, `powershell.exe`) would be verified successfully and then fail
+remotely. Resolution reads the daemon's environment, so the caller never
+supplies a `PATH`.
+
 ## Processes and PTYs
 
 ```text

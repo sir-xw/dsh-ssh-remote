@@ -1,9 +1,13 @@
 import FileSystem, { FsError, type FsTarget } from '@deepseek-ai/dsh-fs';
+import { existsSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox';
-import type {
-  SubprocessRuntime,
-  SubprocessSpawnSpec,
-  SubprocessTerminalSpawnSpec,
+import {
+  SubprocessExecutableNotFoundError,
+  type SubprocessRuntime,
+  type SubprocessSpawnSpec,
+  type SubprocessTerminalEnvironment,
+  type SubprocessTerminalSpawnSpec,
 } from '@deepseek-ai/dsh-subprocess';
 import type { TerminalSessionService, TerminalSpawnRequest } from '@deepseek-ai/dsh-terminal';
 import { createRemoteFileSystemAdapter } from './fs.js';
@@ -256,16 +260,37 @@ export function buildRemoteSshInvocation(
  * Route process execution by Workspace cwd. The stock local provider still
  * owns stream collection, PTY behavior, cancellation and teardown; for a
  * mapped cwd its managed child is the system OpenSSH client.
+ *
+ * Execution-world lookup is routed too: a terminal or shell consumer resolves
+ * its shell against the environment that will run it, so `resolveExecutable`
+ * and `terminalEnvironment` answer for the SSH host instead of the client. A
+ * client-local answer (`cmd.exe`, `powershell.exe`) otherwise verifies
+ * successfully and then fails on the remote host, and shell discovery would
+ * offer shells that host cannot start.
  */
 export function installRemoteSubprocessRouter(
   subprocess: SubprocessRuntime,
   resolveRemotePath: RemotePathResolver,
-): () => void {
+  helpers: RemoteHelperProvider,
+  resolveTerminalPath: RemotePathResolver = resolveRemotePath,
+): { restore: () => void; delegate: RemoteSubprocessDelegate } {
   const originalSpawn = subprocess.spawn;
   const originalSpawnTerminal = subprocess.spawnTerminal;
+  const originalResolveExecutable = subprocess.resolveExecutable;
+  const originalTerminalEnvironment = subprocess.terminalEnvironment;
+  // The unwrapped provider operations, captured before any wrapper replaces
+  // them. A workspace-bound binding delegates here, never back into the routed
+  // service: for its own allocation this router replaces `spawnTerminal` with
+  // that binding, so re-reading the property would call the binding again.
+  const delegate: RemoteSubprocessDelegate = {
+    spawn: spec => originalSpawn.call(subprocess, spec),
+    spawnTerminal: spec => originalSpawnTerminal.call(subprocess, spec),
+  };
+  const remotePath = (path: string | undefined): string | undefined =>
+    path === undefined ? undefined : isSshPath(path) ? path : resolveRemotePath(path);
 
   subprocess.spawn = function (spec: SubprocessSpawnSpec) {
-    const remoteCwd = isSshPath(spec.cwd) ? spec.cwd : resolveRemotePath(spec.cwd);
+    const remoteCwd = remotePath(spec.cwd);
     if (remoteCwd === undefined) return originalSpawn.call(subprocess, spec);
     return originalSpawn.call(subprocess, {
       ...spec,
@@ -276,7 +301,7 @@ export function installRemoteSubprocessRouter(
   };
 
   subprocess.spawnTerminal = function (spec: SubprocessTerminalSpawnSpec) {
-    const remoteCwd = isSshPath(spec.cwd) ? spec.cwd : resolveRemotePath(spec.cwd);
+    const remoteCwd = remotePath(spec.cwd);
     if (remoteCwd === undefined) return originalSpawnTerminal.call(subprocess, spec);
     return originalSpawnTerminal.call(subprocess, {
       ...spec,
@@ -286,17 +311,394 @@ export function installRemoteSubprocessRouter(
     });
   };
 
-  return () => {
-    subprocess.spawn = originalSpawn;
-    subprocess.spawnTerminal = originalSpawnTerminal;
+  // Execution-world lookup without a workspace identity stays client-local: a
+  // bare name carries no remote address. Consumers that DO know the workspace
+  // resolve through the agent-bound facade instead (see
+  // `createRemoteSubprocessBinding`); a bare name here is a local program such
+  // as `rg`, and an anchored path is remote by construction.
+  subprocess.resolveExecutable = async function (
+    command: string,
+    _env?: Readonly<Record<string, string>>,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const remoteCwd = remotePath(command);
+    if (remoteCwd === undefined) return originalResolveExecutable.call(subprocess, command, _env, signal);
+    return resolveRemoteExecutable(helpers, remoteCwd, command, signal);
+  };
+
+  subprocess.terminalEnvironment = async function (signal?: AbortSignal): Promise<SubprocessTerminalEnvironment> {
+    const preferred = await originalTerminalEnvironment.call(subprocess, signal);
+    const mapped = preferred.defaultShell === undefined ? undefined : resolveTerminalPath(preferred.defaultShell);
+    const remoteCwd = mapped !== undefined && isSshPath(mapped)
+      ? mapped
+      : remotePath(preferred.defaultShell);
+    if (remoteCwd === undefined) return preferred;
+    return remoteTerminalEnvironment(helpers, remoteCwd, signal);
+  };
+
+  return {
+    restore: () => {
+      subprocess.spawn = originalSpawn;
+      subprocess.spawnTerminal = originalSpawnTerminal;
+      subprocess.resolveExecutable = originalResolveExecutable;
+      subprocess.terminalEnvironment = originalTerminalEnvironment;
+    },
+    delegate,
   };
 }
 
 /**
- * Route persistent PTY sessions by workspace cwd. A remote cwd selects the
- * `ssh` backend (see `RemoteTerminalBackend`); local sessions keep the stock
- * `bash` backend untouched.
+ * Resolve one executable on the SSH host that owns `remoteCwd`.
+ *
+ * A PATH name resolves through the host's own `PATH`. An absolute path is
+ * verified as executable, and — because a host may report a login shell and
+ * candidates that are only reachable by name — a path that fails that check is
+ * retried once as its trailing component. This mirrors the harness's own
+ * `resolveExecutable` contract (absolute paths verified, bare names searched)
+ * while tolerating a path-shaped name whose directory is not the one the host
+ * would search.
  */
+async function resolveRemoteExecutable(
+  helpers: RemoteHelperProvider,
+  remoteCwd: string,
+  command: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const client = await helpers.client(remoteCwd, signal);
+  const attempt = async (candidate: string): Promise<string | undefined> => {
+    try {
+      const resolved = await client.call<{ path: string }>(
+        'executable/resolve',
+        { command: candidate },
+        { signal, timeoutMs: 15_000 },
+      );
+      return resolved.path;
+    } catch (error) {
+      if ((error as { code?: unknown } | undefined)?.code === 'E_NOT_FOUND') return undefined;
+      throw error;
+    }
+  };
+  const name = executableName(command);
+  const candidates = name !== '' && name !== command ? [command, name] : [command];
+  for (const candidate of candidates) {
+    const resolved = await attempt(candidate);
+    if (resolved !== undefined) return resolved;
+  }
+  throw new SubprocessExecutableNotFoundError(
+    `remote executable lookup: command ${JSON.stringify(command)} is not executable on ${parseSshUri(remoteCwd).host}`,
+  );
+}
+
+/**
+ * Shell-selection facts for one SSH execution world. The helper only runs on
+ * POSIX hosts, so a remote world is always `posix`; its validated login shell
+ * is the default the remote PTY backend would start.
+ */
+async function remoteTerminalEnvironment(
+  helpers: RemoteHelperProvider,
+  remoteCwd: string,
+  signal?: AbortSignal,
+): Promise<SubprocessTerminalEnvironment> {
+  const client = await helpers.client(remoteCwd, signal);
+  const shell = client.hello.platform.shell;
+  return {
+    platform: 'posix',
+    ...(typeof shell === 'string' && shell.startsWith('/') ? { defaultShell: shell } : {}),
+  };
+}
+
+/** The provider operations a remote binding delegates to. */
+export interface RemoteSubprocessDelegate {
+  spawn(spec: SubprocessSpawnSpec): unknown;
+  spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<unknown>;
+}
+
+/** The slice of the subprocess seam a terminal consumer uses, bound to one workspace. */
+export interface RemoteSubprocessBinding {
+  resolveExecutable(command: string, env?: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string>;
+  terminalEnvironment(signal?: AbortSignal): Promise<SubprocessTerminalEnvironment>;
+  spawn(spec: SubprocessSpawnSpec): unknown;
+  spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<unknown>;
+}
+
+/**
+ * Subprocess facade for one agent whose workspace is an SSH anchor. Mounted on
+ * the agent's own context, so every terminal entry point — shell discovery,
+ * environment inspection, and terminal allocation — resolves inside the
+ * workspace that agent owns rather than through process-wide state. Shell
+ * discovery asks for bare names (`bash`, `zsh`, ...), which is exactly the case
+ * the shared provider cannot answer: the workspace identity is only available
+ * on the agent context that the harness passes to these consumers.
+ *
+ * `delegate` must be the provider's UNWRAPPED operations (`installRemoteSubprocessRouter`
+ * returns them). The binding is installed as the provider's own `spawnTerminal`
+ * for the duration of one allocation, so re-reading that property from the
+ * service at call time would recurse into the binding itself.
+ */
+export function createRemoteSubprocessBinding(
+  delegate: RemoteSubprocessDelegate,
+  remoteCwd: string,
+  helpers: RemoteHelperProvider,
+): RemoteSubprocessBinding {
+  const route = (spec: SubprocessSpawnSpec | SubprocessTerminalSpawnSpec, terminal: boolean) =>
+    terminal
+      ? delegate.spawnTerminal({
+        ...(spec as SubprocessTerminalSpawnSpec),
+        argv: buildRemoteSshInvocation(remoteCwd, spec.argv, spec.env, true, () => undefined),
+        cwd: process.cwd(),
+        env: undefined,
+      })
+      : delegate.spawn({
+        ...(spec as SubprocessSpawnSpec),
+        argv: buildRemoteSshInvocation(remoteCwd, spec.argv, spec.env, false, () => undefined),
+        cwd: process.cwd(),
+        env: undefined,
+      });
+  return {
+    resolveExecutable: (command, _env, signal) => resolveRemoteExecutable(helpers, remoteCwd, command, signal),
+    terminalEnvironment: signal => remoteTerminalEnvironment(helpers, remoteCwd, signal),
+    spawn: spec => route(spec, false),
+    spawnTerminal: spec => {
+      const argv = buildRemoteSshInvocation(remoteCwd, spec.argv, spec.env, true, () => undefined);
+      return delegate.spawnTerminal({
+        ...spec,
+        argv: withAbsoluteTerminalProgram(argv),
+        cwd: process.cwd(),
+        env: undefined,
+      });
+    },
+  };
+}
+
+/**
+ * Give a terminal invocation an absolute client program on Windows. node-pty's
+ * ConPTY backend starts its `file` without PATH/PATHEXT resolution, so the bare
+ * `ssh` this router emits fails there with a bare "File not found" while every
+ * ordinary spawn — which does resolve PATH names — works. POSIX keeps the bare
+ * name: node-pty resolves it through `execvp`, and the PATH entry named at
+ * startup is the one the user's shell configuration expects.
+ *
+ * A program that cannot be located keeps its original argv, so a missing client
+ * binary still surfaces the provider's own error rather than a rewritten one.
+ */
+function withAbsoluteTerminalProgram(argv: readonly string[]): readonly string[] {
+  if (process.platform !== 'win32') return argv;
+  const absolute = resolveLocalBinary(argv[0]);
+  return absolute === undefined ? argv : [absolute, ...argv.slice(1)];
+}
+
+/**
+ * Resolve one client-local program to an absolute path through `PATH` and
+ * `PATHEXT`, mirroring what a shell or Node's own spawn does. Returns
+ * `undefined` for an already-absolute path that does not exist and for a name
+ * that cannot be found, leaving the caller's argv untouched.
+ */
+function resolveLocalBinary(program: string | undefined): string | undefined {
+  if (program === undefined || program.length === 0) return undefined;
+  if (isAbsolute(program)) return existsSync(program) ? program : undefined;
+  // A program that already carries a Windows extension is used verbatim; every
+  // other name is probed with each `PATHEXT` entry (lower-case, because the
+  // real files are `.exe`/`.cmd` while `PATHEXT` advertises `.EXE`/`.CMD`).
+  const hasExtension = process.platform === 'win32' && /\.[^./\\]+$/u.test(program);
+  const extensions = hasExtension
+    ? ['']
+    : process.platform === 'win32'
+      ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(extension => extension.length > 0)
+      : [''];
+  const names = extensions.map(extension => `${program}${extension.toLowerCase()}`);
+  for (const directory of (process.env.PATH ?? '').split(delimiter)) {
+    if (directory.length === 0) continue;
+    for (const name of names) {
+      const candidate = join(directory, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Shell discovery and terminal allocation for one remote workspace. `discoverShells`
+ * verifies each candidate through the bound provider, so the offered list is
+ * exactly the set of programs the remote host can start.
+ */
+async function discoverRemoteShells(
+  binding: RemoteSubprocessBinding,
+  configured: RemoteShellProfile | undefined,
+  candidates: readonly string[],
+  signal?: AbortSignal,
+): Promise<RemoteShellProfile[]> {
+  const environment = await binding.terminalEnvironment(signal);
+  // The declared default is the remote host's own login shell. A host whose
+  // login shell is only reachable by name is handled inside
+  // `resolveRemoteExecutable`, which retries a failed path as its bare name, so
+  // one failed resolution here must not empty the whole list: the candidate
+  // sweep below still offers every shell the host can actually start.
+  const declared = configured ?? { path: environment.defaultShell ?? '/bin/sh' };
+  const preferred = await firstStartableShell(binding, [declared], signal);
+  const found = await Promise.all(candidates.map(async (candidate) => {
+    try {
+      return await verifyRemoteShell(binding, { path: candidate }, signal);
+    } catch (error) {
+      if (error instanceof SubprocessExecutableNotFoundError) return undefined;
+      throw error;
+    }
+  }));
+  const shells = new Map<string, RemoteShellProfile>();
+  for (const shell of [preferred, ...found]) {
+    if (shell === undefined) continue;
+    const kind = shell.path.slice(shell.path.lastIndexOf('/') + 1).toLowerCase();
+    if (!shells.has(kind)) shells.set(kind, shell);
+  }
+  return [...shells.values()];
+}
+
+/** Verify candidate profiles in order, returning the first the host can start. */
+async function firstStartableShell(
+  binding: RemoteSubprocessBinding,
+  profiles: readonly RemoteShellProfile[],
+  signal?: AbortSignal,
+): Promise<RemoteShellProfile | undefined> {
+  for (const profile of profiles) {
+    try {
+      return await verifyRemoteShell(binding, profile, signal);
+    } catch (error) {
+      if (!(error instanceof SubprocessExecutableNotFoundError)) throw error;
+    }
+  }
+  return undefined;
+}
+
+/** The trailing path component, used to retry one absolute path as a PATH name. */
+function executableName(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+/** Verify one candidate on the remote host, mirroring the harness's own shell profile shape. */
+async function verifyRemoteShell(
+  binding: RemoteSubprocessBinding,
+  profile: RemoteShellProfile,
+  signal?: AbortSignal,
+): Promise<RemoteShellProfile> {
+  const path = await binding.resolveExecutable(profile.path, undefined, signal);
+  const name = profile.name ?? path.slice(path.lastIndexOf('/') + 1);
+  const kind = name.toLowerCase().replace(/\.exe$/u, '');
+  const args = profile.args ?? (kind === 'cmd' ? [] : kind === 'pwsh' || kind === 'powershell' ? ['-NoLogo'] : ['-i']);
+  return { path, name, args };
+}
+
+/** One terminal agent's scoped identity: enough to bind its workspace. */
+export interface TerminalControllerAgent {
+  session: { header: { cwd?: string } };
+}
+
+interface RemoteShellProfile {
+  path: string;
+  name?: string;
+  args?: string[];
+}
+
+/** The slice of the Web terminal controller this router rewrites. */
+export interface TerminalControllerService {
+  spawn?(
+    agent: TerminalControllerAgent,
+    owner: unknown,
+    request: RemoteTerminalCreateRequest,
+    signal?: AbortSignal,
+  ): Promise<unknown>;
+  shells?(agent: TerminalControllerAgent, signal?: AbortSignal): Promise<RemoteShellProfile[]>;
+}
+
+export interface RemoteTerminalCreateRequest {
+  shellPath?: string;
+  [key: string]: unknown;
+}
+
+/** The service whose `spawnTerminal` one scoped allocation redirects. */
+export interface RemoteTerminalAllocationTarget {
+  spawnTerminal: SubprocessRuntime['spawnTerminal'];
+}
+
+/**
+ * Bind Web-terminal shell resolution to each agent's own workspace. The panel
+ * discovers shells, inspects the environment, and allocates the terminal
+ * through `agent.ctx`, but the shared subprocess provider has no workspace
+ * identity, so a bare candidate such as `bash` would be verified on the client
+ * and then fail on the host. Every entry point here carries the agent, so the
+ * remote provider is selected from that agent's workspace instead of from
+ * process-wide state.
+ *
+ * Allocation itself stays with the stock controller: this router only supplies
+ * the resolved remote shell and redirects the single `spawnTerminal` call that
+ * immediately follows it.
+ */
+export function installRemoteTerminalControllerRouter(
+  controller: TerminalControllerService,
+  resolveRemotePath: RemotePathResolver,
+  helpers: RemoteHelperProvider,
+  delegate: RemoteSubprocessDelegate,
+  target: RemoteTerminalAllocationTarget,
+): () => void {
+  const originalSpawn = controller.spawn;
+  const originalShells = controller.shells;
+  if (typeof originalSpawn !== 'function' || typeof originalShells !== 'function') return () => {};
+  const remoteCwdOf = (agent: TerminalControllerAgent): string | undefined => {
+    const cwd = agent.session.header.cwd;
+    return cwd === undefined ? undefined : isSshPath(cwd) ? cwd : resolveRemotePath(cwd);
+  };
+
+  controller.shells = async function (agent, signal) {
+    const remoteCwd = remoteCwdOf(agent);
+    if (remoteCwd === undefined) return originalShells.call(controller, agent, signal);
+    const binding = createRemoteSubprocessBinding(delegate, remoteCwd, helpers);
+    return discoverRemoteShells(binding, undefined, DEFAULT_REMOTE_SHELL_CANDIDATES, signal);
+  };
+
+  controller.spawn = async function (agent, owner, request, signal) {
+    const remoteCwd = remoteCwdOf(agent);
+    if (remoteCwd === undefined) return originalSpawn.call(controller, agent, owner, request, signal);
+    const binding = createRemoteSubprocessBinding(delegate, remoteCwd, helpers);
+    const shells = await discoverRemoteShells(binding, undefined, DEFAULT_REMOTE_SHELL_CANDIDATES, signal);
+    const shell = request.shellPath === undefined
+      ? shells[0]
+      : shells.find(candidate => candidate.path === request.shellPath);
+    if (shell === undefined) throw new Error('Selected shell is not available in this execution environment');
+    return withRemoteTerminal(target, binding, () => originalSpawn.call(
+      controller,
+      agent,
+      owner,
+      { ...request, shellPath: shell.path },
+      signal,
+    ));
+  };
+
+  return () => {
+    controller.spawn = originalSpawn;
+    controller.shells = originalShells;
+  };
+}
+
+/**
+ * Run one stock terminal allocation against `binding` while that allocation
+ * spawns. The controller resolves `subprocess` before this call and allocates
+ * in the same turn afterwards, so the swap covers exactly the allocation it
+ * belongs to — no workspace binding outlives the operation. The binding
+ * delegates to the provider's unwrapped operations, so this swap cannot
+ * recurse; the `finally` restores whatever wrapper is current rather than the
+ * value read here, so an overlapping allocation is never clobbered.
+ */
+function withRemoteTerminal<T>(
+  target: RemoteTerminalAllocationTarget,
+  binding: RemoteSubprocessBinding,
+  allocate: () => Promise<T>,
+): Promise<T> {
+  const previous = target.spawnTerminal;
+  target.spawnTerminal = spec => binding.spawnTerminal(spec) as ReturnType<SubprocessRuntime['spawnTerminal']>;
+  return allocate().finally(() => {
+    if (target.spawnTerminal !== previous) target.spawnTerminal = previous;
+  });
+}
+
+const DEFAULT_REMOTE_SHELL_CANDIDATES = ['zsh', 'bash', 'fish', 'pwsh', 'powershell', 'cmd'];
 export function installRemoteTerminalRouter(
   terminals: TerminalSessionService,
   resolveRemotePath: RemotePathResolver,
